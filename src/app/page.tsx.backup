@@ -1,0 +1,1163 @@
+'use client';
+
+import { useState, useEffect, useRef } from 'react';
+import { Shield, Radio, MapPin, AlertTriangle, Clock, Users, Map, Video, Phone, Navigation, Wifi, WifiOff } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Alert, AlertDescription } from '@/components/ui/alert';
+import { Badge } from '@/components/ui/badge';
+import { motion, AnimatePresence } from 'framer-motion';
+import { io, Socket } from 'socket.io-client';
+import { PatrolMap } from '@/components/maps/PatrolMap';
+import { HQMap } from '@/components/maps/HQMap';
+
+type View = 'landing' | 'patrol-register' | 'patrol-dashboard' | 'hq-dashboard';
+type UserRole = 'hq' | 'patrol' | null;
+
+interface PatrolData {
+  id: string;
+  code: string;
+  name: string;
+  camp: string;
+  unit: string;
+  strength: number;
+  status: string;
+}
+
+interface PatrolLocation {
+  patrolId: string;
+  latitude: number;
+  longitude: number;
+  timestamp: string;
+}
+
+export default function HomePage() {
+  const [view, setView] = useState<View>('landing');
+  const [role, setRole] = useState<UserRole>(null);
+  const [accessCode, setAccessCode] = useState('');
+  const [error, setError] = useState('');
+  const [patrolData, setPatrolData] = useState<PatrolData | null>(null);
+  const [currentTime, setCurrentTime] = useState(new Date());
+  const [socket, setSocket] = useState<Socket | null>(null);
+  const [isOnline, setIsOnline] = useState(true);
+  const [isPatrolling, setIsPatrolling] = useState(false);
+  const [currentLocation, setCurrentLocation] = useState<{ lat: number; lng: number } | null>(null);
+  const [locationHistory, setLocationHistory] = useState<PatrolLocation[]>([]);
+  const [bufferedLocations, setBufferedLocations] = useState<any[]>([]);
+  const [incomingCall, setIncomingCall] = useState<any>(null);
+  const [hqPatrols, setHqPatrols] = useState<any[]>([]);
+  const [sosAlerts, setSosAlerts] = useState<any[]>([]);
+  const [showSosPanel, setShowSosPanel] = useState(false);
+  const locationIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Update clock
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Monitor online/offline status
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  const syncBufferedLocations = async () => {
+    if (bufferedLocations.length === 0 || !patrolData) return;
+
+    try {
+      await fetch('/api/patrol/location/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          patrolId: patrolData.id,
+          locations: bufferedLocations
+        })
+      });
+
+      setBufferedLocations([]);
+    } catch (error) {
+      console.error('Failed to sync buffered locations:', error);
+    }
+  };
+
+  // Sync buffered locations when coming back online
+  useEffect(() => {
+    if (isOnline && bufferedLocations.length > 0) {
+      syncBufferedLocations();
+    }
+  }, [isOnline, bufferedLocations]);
+
+  const handleCodeSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    setError('');
+
+    if (accessCode === '8993') {
+      setRole('hq');
+      setView('hq-dashboard');
+      initializeHqConnection();
+    } else if (accessCode === '1526') {
+      setRole('patrol');
+      setView('patrol-register');
+    } else {
+      setError('Invalid access code. Please try again.');
+    }
+  };
+
+  const handlePatrolRegister = async (data: any) => {
+    setPatrolData(data);
+    setView('patrol-dashboard');
+    initializePatrolConnection(data.id);
+  };
+
+  const initializePatrolConnection = (patrolId: string) => {
+    const newSocket = io('/?XTransformPort=3003');
+    
+    newSocket.on('connect', () => {
+      console.log('Connected to tracking service');
+      newSocket.emit('patrol:connect', { patrolId });
+    });
+
+    newSocket.on('patrol:incoming:call', (data) => {
+      setIncomingCall(data);
+    });
+
+    newSocket.on('patrol:sos:route', (data) => {
+      console.log('SOS route received:', data);
+      // Show route to SOS location
+    });
+
+    setSocket(newSocket);
+  };
+
+  const initializeHqConnection = () => {
+    const newSocket = io('/?XTransformPort=3003');
+    
+    newSocket.on('connect', () => {
+      console.log('HQ connected to tracking service');
+      newSocket.emit('hq:connect', { role: 'hq' });
+    });
+
+    newSocket.on('patrol:location:update', (data) => {
+      setHqPatrols((prev) => {
+        const exists = prev.find(p => p.id === data.patrolId);
+        if (exists) {
+          return prev.map(p => p.id === data.patrolId 
+            ? { ...p, latitude: data.latitude, longitude: data.longitude, lastUpdate: data.timestamp }
+            : p
+          );
+        }
+        return prev;
+      });
+    });
+
+    newSocket.on('patrol:started', (data) => {
+      setHqPatrols((prev) => prev.map(p => p.id === data.patrolId 
+        ? { ...p, status: 'patrolling', sessionId: data.sessionId }
+        : p
+      ));
+    });
+
+    newSocket.on('patrol:stopped', (data) => {
+      setHqPatrols((prev) => prev.map(p => p.id === data.patrolId 
+        ? { ...p, status: 'idle' }
+        : p
+      ));
+    });
+
+    newSocket.on('sos:alert', (data) => {
+      setSosAlerts((prev) => [data, ...prev]);
+      setShowSosPanel(true);
+    });
+
+    newSocket.on('sos:status:updated', (data) => {
+      setSosAlerts((prev) => prev.map(sos => sos.id === data.sosId 
+        ? { ...sos, status: data.status }
+        : sos
+      ));
+    });
+
+    setSocket(newSocket);
+    loadHqData();
+  };
+
+  const loadHqData = async () => {
+    try {
+      // Load patrols
+      const patrolsRes = await fetch('/api/hq/patrols');
+      const patrolsData = await patrolsRes.json();
+      if (patrolsData.success) {
+        setHqPatrols(patrolsData.patrols);
+      }
+
+      // Load SOS alerts
+      const sosRes = await fetch('/api/hq/sos');
+      const sosData = await sosRes.json();
+      if (sosData.success) {
+        setSosAlerts(sosData.alerts);
+      }
+    } catch (error) {
+      console.error('Failed to load HQ data:', error);
+    }
+  };
+
+  const togglePatrol = async () => {
+    if (!patrolData) return;
+
+    try {
+      const action = isPatrolling ? 'stop' : 'start';
+      const response = await fetch('/api/patrol/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ patrolId: patrolData.id, action })
+      });
+
+      if (response.ok) {
+        setIsPatrolling(!isPatrolling);
+
+        if (!isPatrolling) {
+          // Start GPS tracking
+          startGpsTracking();
+          socket?.emit('patrol:start', { patrolId: patrolData.id, sessionId: `session_${Date.now()}` });
+        } else {
+          // Stop GPS tracking
+          stopGpsTracking();
+          socket?.emit('patrol:stop', { patrolId: patrolData.id, sessionId: `session_${Date.now()}` });
+        }
+      }
+    } catch (error) {
+      console.error('Failed to toggle patrol:', error);
+    }
+  };
+
+  const startGpsTracking = () => {
+    if (!navigator.geolocation) {
+      console.error('Geolocation not supported');
+      return;
+    }
+
+    locationIntervalRef.current = setInterval(() => {
+      navigator.geolocation.getCurrentPosition(
+        async (position) => {
+          const { latitude, longitude, altitude, accuracy } = position.coords;
+          const location = {
+            patrolId: patrolData!.id,
+            latitude,
+            longitude,
+            altitude,
+            accuracy,
+            timestamp: new Date().toISOString()
+          };
+
+          setCurrentLocation({ lat: latitude, lng: longitude });
+          setLocationHistory((prev) => [...prev, location].slice(-100)); // Keep last 100 points
+
+          if (isOnline) {
+            try {
+              await fetch('/api/patrol/location', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(location)
+              });
+              socket?.emit('patrol:location', location);
+            } catch (error) {
+              console.error('Failed to send location:', error);
+              setBufferedLocations((prev) => [...prev, location]);
+            }
+          } else {
+            setBufferedLocations((prev) => [...prev, location]);
+          }
+        },
+        (error) => {
+          console.error('GPS error:', error);
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 10000,
+          maximumAge: 0
+        }
+      );
+    }, 3000); // GPS sync every 3 seconds
+  };
+
+  const stopGpsTracking = () => {
+    if (locationIntervalRef.current) {
+      clearInterval(locationIntervalRef.current);
+      locationIntervalRef.current = null;
+    }
+  };
+
+  const triggerSos = async () => {
+    if (!patrolData || !currentLocation) return;
+
+    try {
+      const response = await fetch('/api/patrol/sos', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          patrolId: patrolData.id,
+          latitude: currentLocation.lat,
+          longitude: currentLocation.lng,
+          message: 'SOS - Emergency assistance required'
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        socket?.emit('patrol:sos', {
+          patrolId: patrolData.id,
+          latitude: currentLocation.lat,
+          longitude: currentLocation.lng,
+          message: 'SOS - Emergency assistance required'
+        });
+        alert('SOS alert sent! HQ and nearby patrols have been notified.');
+      }
+    } catch (error) {
+      console.error('Failed to send SOS:', error);
+    }
+  };
+
+  const handleCallResponse = (accepted: boolean) => {
+    socket?.emit('patrol:call:response', {
+      callId: incomingCall.callId,
+      accepted
+    });
+    setIncomingCall(null);
+  };
+
+  const handleLogout = () => {
+    if (isPatrolling) {
+      stopGpsTracking();
+    }
+    socket?.disconnect();
+    setView('landing');
+    setRole(null);
+    setAccessCode('');
+    setError('');
+    setPatrolData(null);
+    setIsPatrolling(false);
+    setCurrentLocation(null);
+    setLocationHistory([]);
+    setBufferedLocations([]);
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 flex flex-col">
+      {/* Header */}
+      <header className="border-b border-slate-800 bg-slate-950/50 backdrop-blur-sm">
+        <div className="container mx-auto px-4 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 bg-emerald-600 rounded-lg flex items-center justify-center">
+              <Shield className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <h1 className="text-lg font-bold text-white">10 Div HQ</h1>
+              <p className="text-xs text-slate-400">Military Patrol Tracking System</p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            {role && (
+              <>
+                <div className="flex items-center gap-2 text-sm">
+                  {isOnline ? (
+                    <Wifi className="w-4 h-4 text-emerald-500" />
+                  ) : (
+                    <WifiOff className="w-4 h-4 text-red-500" />
+                  )}
+                  <span className={isOnline ? 'text-emerald-500' : 'text-red-500'}>
+                    {isOnline ? 'Online' : 'Offline'}
+                  </span>
+                </div>
+                <Button variant="outline" onClick={handleLogout} className="border-slate-700 text-slate-300 hover:bg-slate-800">
+                  Logout
+                </Button>
+              </>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="container mx-auto px-4 py-8 flex-1">
+        <AnimatePresence mode="wait">
+          {view === 'landing' && (
+            <motion.div
+              key="landing"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <LandingPage
+                accessCode={accessCode}
+                setAccessCode={setAccessCode}
+                onSubmit={handleCodeSubmit}
+                error={error}
+              />
+            </motion.div>
+          )}
+
+          {view === 'patrol-register' && (
+            <motion.div
+              key="patrol-register"
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+            >
+              <PatrolRegistration onRegister={handlePatrolRegister} onCancel={handleLogout} />
+            </motion.div>
+          )}
+
+          {view === 'patrol-dashboard' && patrolData && (
+            <motion.div
+              key="patrol-dashboard"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+            >
+              <PatrolDashboard
+                patrolData={patrolData}
+                currentTime={currentTime}
+                isPatrolling={isPatrolling}
+                isOnline={isOnline}
+                currentLocation={currentLocation}
+                locationHistory={locationHistory}
+                bufferedLocations={bufferedLocations}
+                incomingCall={incomingCall}
+                onTogglePatrol={togglePatrol}
+                onSos={triggerSos}
+                onCallResponse={handleCallResponse}
+              />
+            </motion.div>
+          )}
+
+          {view === 'hq-dashboard' && (
+            <motion.div
+              key="hq-dashboard"
+              initial={{ opacity: 0, x: 20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: -20 }}
+            >
+              <HQDashboard
+                currentTime={currentTime}
+                patrols={hqPatrols}
+                sosAlerts={sosAlerts}
+                showSosPanel={showSosPanel}
+                onToggleSosPanel={() => setShowSosPanel(!showSosPanel)}
+                onRefresh={loadHqData}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </main>
+
+      {/* Footer */}
+      <footer className="border-t border-slate-800 bg-slate-950/50 backdrop-blur-sm">
+        <div className="container mx-auto px-4 py-3">
+          <div className="flex items-center justify-center gap-2 text-sm text-slate-500">
+            <span>Developed by Major Wahid</span>
+            <span className="text-slate-700">|</span>
+            <span>10 Div HQ</span>
+          </div>
+        </div>
+      </footer>
+
+      {/* Incoming Call Modal */}
+      <AnimatePresence>
+        {incomingCall && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-black/70 flex items-center justify-center z-50 p-4"
+          >
+            <Card className="bg-slate-900 border-slate-700 max-w-md w-full">
+              <CardHeader>
+                <CardTitle className="text-white text-xl">Incoming Call</CardTitle>
+                <CardDescription className="text-slate-400">
+                  {incomingCall.callType === 'video' ? 'Video' : 'Audio'} call from {incomingCall.from}
+                </CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="flex gap-3">
+                  <Button
+                    onClick={() => handleCallResponse(true)}
+                    className="flex-1 bg-emerald-600 hover:bg-emerald-700"
+                  >
+                    <Phone className="w-4 h-4 mr-2" />
+                    Accept
+                  </Button>
+                  <Button
+                    onClick={() => handleCallResponse(false)}
+                    variant="destructive"
+                    className="flex-1"
+                  >
+                    Reject
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function LandingPage({ accessCode, setAccessCode, onSubmit, error }: any) {
+  return (
+    <div className="max-w-4xl mx-auto">
+      <div className="text-center mb-12">
+        <motion.div
+          initial={{ scale: 0.8, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          transition={{ duration: 0.5 }}
+          className="w-20 h-20 bg-gradient-to-br from-emerald-500 to-emerald-700 rounded-2xl flex items-center justify-center mx-auto mb-6 shadow-lg shadow-emerald-500/20"
+        >
+          <Radio className="w-10 h-10 text-white" />
+        </motion.div>
+        <h2 className="text-4xl font-bold text-white mb-4">
+          Military Patrol Tracking System
+        </h2>
+        <p className="text-slate-400 text-lg">
+          Real-time location tracking and coordination for military operations
+        </p>
+      </div>
+
+      <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm mb-8">
+        <CardHeader>
+          <CardTitle className="text-white">Access System</CardTitle>
+          <CardDescription className="text-slate-400">
+            Enter your access code to continue
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={onSubmit} className="space-y-4">
+            <div>
+              <Input
+                type="password"
+                placeholder="Enter access code"
+                value={accessCode}
+                onChange={(e) => setAccessCode(e.target.value)}
+                className="bg-slate-800/50 border-slate-700 text-white placeholder:text-slate-500 text-center text-2xl tracking-widest h-16"
+                maxLength={4}
+                autoFocus
+              />
+            </div>
+            {error && (
+              <Alert className="bg-red-950/50 border-red-900/50">
+                <AlertTriangle className="h-4 w-4 text-red-500" />
+                <AlertDescription className="text-red-400">{error}</AlertDescription>
+              </Alert>
+            )}
+            <Button
+              type="submit"
+              className="w-full h-12 bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 hover:to-emerald-800 text-white font-semibold"
+            >
+              Access Dashboard
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+
+      <div className="grid md:grid-cols-3 gap-6">
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader>
+            <div className="w-12 h-12 bg-blue-600/20 rounded-lg flex items-center justify-center mb-3">
+              <MapPin className="w-6 h-6 text-blue-500" />
+            </div>
+            <CardTitle className="text-white text-lg">Real-Time Tracking</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-slate-400 text-sm">
+              Live GPS synchronization every 3 seconds with comprehensive trail history
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader>
+            <div className="w-12 h-12 bg-red-600/20 rounded-lg flex items-center justify-center mb-3">
+              <AlertTriangle className="w-6 h-6 text-red-500" />
+            </div>
+            <CardTitle className="text-white text-lg">SOS Alerts</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-slate-400 text-sm">
+              Instant emergency notifications with automatic routing to nearest responders
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader>
+            <div className="w-12 h-12 bg-amber-600/20 rounded-lg flex items-center justify-center mb-3">
+              <Clock className="w-6 h-6 text-amber-500" />
+            </div>
+            <CardTitle className="text-white text-lg">Offline Support</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <p className="text-slate-400 text-sm">
+              GPS buffering when network drops with automatic sync when reconnected
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function PatrolRegistration({ onRegister, onCancel }: { onRegister: (data: any) => void; onCancel: () => void }) {
+  const [formData, setFormData] = useState({
+    camp: '',
+    unit: '',
+    name: '',
+    strength: ''
+  });
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsSubmitting(true);
+
+    try {
+      const response = await fetch('/api/patrol/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...formData,
+          strength: parseInt(formData.strength)
+        })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        onRegister(data.patrol);
+      } else {
+        console.error('Registration failed');
+      }
+    } catch (error) {
+      console.error('Registration error:', error);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="max-w-2xl mx-auto">
+      <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+        <CardHeader>
+          <CardTitle className="text-white text-2xl">Patrol Commander Registration</CardTitle>
+          <CardDescription className="text-slate-400">
+            Register your patrol details to begin tracking
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-2">Camp Name</label>
+              <Input
+                type="text"
+                value={formData.camp}
+                onChange={(e) => setFormData({ ...formData, camp: e.target.value })}
+                className="bg-slate-800/50 border-slate-700 text-white"
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-2">Unit</label>
+              <Input
+                type="text"
+                value={formData.unit}
+                onChange={(e) => setFormData({ ...formData, unit: e.target.value })}
+                className="bg-slate-800/50 border-slate-700 text-white"
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-2">Name / Callsign</label>
+              <Input
+                type="text"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                className="bg-slate-800/50 border-slate-700 text-white"
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-slate-300 mb-2">Strength (Number of Personnel)</label>
+              <Input
+                type="number"
+                value={formData.strength}
+                onChange={(e) => setFormData({ ...formData, strength: e.target.value })}
+                className="bg-slate-800/50 border-slate-700 text-white"
+                min="1"
+                required
+              />
+            </div>
+            <div className="flex gap-3 pt-4">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={onCancel}
+                className="flex-1 border-slate-700 text-slate-300"
+              >
+                Cancel
+              </Button>
+              <Button
+                type="submit"
+                disabled={isSubmitting}
+                className="flex-1 bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 hover:to-emerald-800 text-white"
+              >
+                {isSubmitting ? 'Registering...' : 'Register & Start Patrol'}
+              </Button>
+            </div>
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function PatrolDashboard({ patrolData, currentTime, isPatrolling, isOnline, currentLocation, locationHistory, bufferedLocations, incomingCall, onTogglePatrol, onSos, onCallResponse }: any) {
+  return (
+    <div className="h-[calc(100vh-180px)]">
+      <div className="flex items-center justify-between mb-6">
+        <div>
+          <h2 className="text-3xl font-bold text-white mb-1">Patrol Dashboard</h2>
+          <p className="text-slate-400">Patrol Commander: {patrolData.name}</p>
+        </div>
+        <div className="text-right">
+          <div className="text-3xl font-mono font-bold text-emerald-500">
+            {currentTime.toLocaleTimeString()}
+          </div>
+          <div className="text-sm text-slate-500">{currentTime.toLocaleDateString()}</div>
+        </div>
+      </div>
+
+      <div className="grid lg:grid-cols-3 gap-6 mb-6">
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-white text-base">Unit</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-emerald-500">{patrolData.unit}</div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-white text-base">Camp</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-blue-500">{patrolData.camp}</div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-white text-base">Strength</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-2xl font-bold text-amber-500">{patrolData.strength}</div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm mb-6">
+        <CardContent className="pt-6">
+          <div className="flex gap-4">
+            <Button
+              onClick={onTogglePatrol}
+              className={isPatrolling 
+                ? 'flex-1 h-16 bg-red-600 hover:bg-red-700 text-white text-lg font-semibold' 
+                : 'flex-1 h-16 bg-gradient-to-r from-emerald-600 to-emerald-700 hover:from-emerald-700 hover:to-emerald-800 text-white text-lg font-semibold'
+              }
+            >
+              {isPatrolling ? 'Stop Patrol' : 'Start Patrol'}
+            </Button>
+            <Button
+              onClick={onSos}
+              disabled={!currentLocation}
+              variant="destructive"
+              className="h-16 px-8 bg-red-600 hover:bg-red-700 disabled:opacity-50"
+            >
+              <AlertTriangle className="w-6 h-6" />
+              SOS
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <div className="grid lg:grid-cols-2 gap-6">
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader>
+            <CardTitle className="text-white flex items-center justify-between">
+              <span>Patrol Map</span>
+              <Badge variant={isOnline ? 'default' : 'destructive'} className={isOnline ? 'bg-emerald-600' : 'bg-red-600'}>
+                {isOnline ? 'Online' : 'Offline'}
+              </Badge>
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="h-[400px]">
+              <PatrolMap
+                currentLocation={currentLocation}
+                locationHistory={locationHistory}
+                showTrail={isPatrolling}
+                className="h-full"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader>
+            <CardTitle className="text-white flex items-center justify-between">
+              <span>Status Information</span>
+              {bufferedLocations.length > 0 && (
+                <Badge variant="secondary" className="bg-amber-600">
+                  {bufferedLocations.length} buffered
+                </Badge>
+              )}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-4">
+              <div className="flex items-center justify-between p-3 bg-slate-800/50 rounded-lg">
+                <div>
+                  <div className="text-sm text-slate-400">Patrol Status</div>
+                  <div className="text-lg font-semibold text-white">
+                    {isPatrolling ? 'Active' : 'Idle'}
+                  </div>
+                </div>
+                <Badge className={isPatrolling ? 'bg-emerald-600' : 'bg-slate-600'}>
+                  {isPatrolling ? 'Patrolling' : 'Stopped'}
+                </Badge>
+              </div>
+
+              <div className="flex items-center justify-between p-3 bg-slate-800/50 rounded-lg">
+                <div>
+                  <div className="text-sm text-slate-400">Connection</div>
+                  <div className="text-lg font-semibold text-white">
+                    {isOnline ? 'Connected' : 'Offline'}
+                  </div>
+                </div>
+                {isOnline ? (
+                  <Wifi className="w-6 h-6 text-emerald-500" />
+                ) : (
+                  <WifiOff className="w-6 h-6 text-red-500" />
+                )}
+              </div>
+
+              <div className="flex items-center justify-between p-3 bg-slate-800/50 rounded-lg">
+                <div>
+                  <div className="text-sm text-slate-400">Location Points</div>
+                  <div className="text-lg font-semibold text-white">
+                    {locationHistory.length}
+                  </div>
+                </div>
+                <MapPin className="w-6 h-6 text-blue-500" />
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function HQDashboard({ currentTime, patrols, sosAlerts, showSosPanel, onToggleSosPanel, onRefresh }: any) {
+  const [filterStatus, setFilterStatus] = useState('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [showTrails, setShowTrails] = useState(true);
+  const [showCamps, setShowCamps] = useState(true);
+  const [showHeatmap, setShowHeatmap] = useState(false);
+
+  const filteredPatrols = patrols.filter((p: any) => {
+    const matchesStatus = filterStatus === 'all' || p.status === filterStatus;
+    const matchesSearch = searchQuery === '' || 
+      p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      p.unit.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (p.camp && p.camp.toLowerCase().includes(searchQuery.toLowerCase()));
+    return matchesStatus && matchesSearch;
+  });
+
+  const activeSosAlerts = sosAlerts.filter((s: any) => s.status === 'active' || s.status === 'responding');
+
+  return (
+    <div className="h-[calc(100vh-180px)] flex flex-col">
+      {/* Header with clock */}
+      <div className="flex items-center justify-between mb-6 flex-shrink-0">
+        <div>
+          <h2 className="text-3xl font-bold text-white mb-1">HQ Control Dashboard</h2>
+          <p className="text-slate-400">Real-time patrol monitoring and coordination</p>
+        </div>
+        <div className="text-right">
+          <div className="text-4xl font-mono font-bold text-emerald-500">
+            {currentTime.toLocaleTimeString()}
+          </div>
+          <div className="text-sm text-slate-500">{currentTime.toLocaleDateString()}</div>
+        </div>
+      </div>
+
+      {/* Stats row */}
+      <div className="grid lg:grid-cols-4 gap-4 mb-6 flex-shrink-0">
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-white text-sm">Active Patrols</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-bold text-emerald-500">
+              {patrols.filter((p: any) => p.status === 'patrolling').length}
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-white text-sm">Total Patrols</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-bold text-blue-500">{patrols.length}</div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-white text-sm">Active SOS</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-bold text-red-500">{activeSosAlerts.length}</div>
+          </CardContent>
+        </Card>
+
+        <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm">
+          <CardHeader className="pb-3">
+            <CardTitle className="text-white text-sm">Camps</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="text-3xl font-bold text-amber-500">
+              {new Set(patrols.map((p: any) => p.camp)).size}
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Main content area */}
+      <div className="flex-1 grid lg:grid-cols-3 gap-6 min-h-0">
+        {/* Map area */}
+        <div className="lg:col-span-2 min-h-0">
+          <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm h-full flex flex-col">
+            <CardHeader className="flex flex-row items-center justify-between flex-shrink-0">
+              <CardTitle className="text-white flex items-center gap-2">
+                <Map className="w-5 h-5" />
+                Live Patrol Map
+              </CardTitle>
+              <div className="flex gap-2">
+                <Button
+                  variant={showHeatmap ? 'default' : 'outline'}
+                  onClick={() => setShowHeatmap(!showHeatmap)}
+                  size="sm"
+                  className={showHeatmap ? 'bg-amber-600 hover:bg-amber-700' : 'border-slate-700 text-slate-300'}
+                >
+                  Heatmap
+                </Button>
+                <Button
+                  variant={showTrails ? 'default' : 'outline'}
+                  onClick={() => setShowTrails(!showTrails)}
+                  size="sm"
+                  className={showTrails ? 'bg-emerald-600 hover:bg-emerald-700' : 'border-slate-700 text-slate-300'}
+                >
+                  Trails
+                </Button>
+                <Button
+                  variant={showCamps ? 'default' : 'outline'}
+                  onClick={() => setShowCamps(!showCamps)}
+                  size="sm"
+                  className={showCamps ? 'bg-blue-600 hover:bg-blue-700' : 'border-slate-700 text-slate-300'}
+                >
+                  Camps
+                </Button>
+                <Button onClick={onRefresh} variant="outline" size="sm" className="border-slate-700 text-slate-300">
+                  Refresh
+                </Button>
+              </div>
+            </CardHeader>
+            <CardContent className="flex-1 min-h-0 p-0">
+              <div className="h-full">
+                <HQMap
+                  patrols={patrols}
+                  sosAlerts={sosAlerts}
+                  camps={[]} // Will be populated from database
+                  showTrails={showTrails}
+                  showCamps={showCamps}
+                  showHeatmap={showHeatmap}
+                  className="h-full"
+                  onPatrolClick={(patrol) => console.log('Patrol clicked:', patrol)}
+                  onSosClick={(sos) => console.log('SOS clicked:', sos)}
+                />
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Patrol list / SOS panel */}
+        <div className="min-h-0 flex flex-col">
+          <div className="flex gap-2 mb-4">
+            <Button
+              variant={showSosPanel ? 'outline' : 'default'}
+              onClick={() => onToggleSosPanel(false)}
+              className={!showSosPanel ? 'bg-emerald-600 hover:bg-emerald-700' : 'border-slate-700 text-slate-300'}
+              size="sm"
+            >
+              <Users className="w-4 h-4 mr-2" />
+              Patrols ({filteredPatrols.length})
+            </Button>
+            <Button
+              variant={showSosPanel ? 'default' : 'outline'}
+              onClick={() => onToggleSosPanel(true)}
+              className={showSosPanel ? 'bg-red-600 hover:bg-red-700' : 'border-slate-700 text-slate-300'}
+              size="sm"
+            >
+              <AlertTriangle className="w-4 h-4 mr-2" />
+              SOS ({activeSosAlerts.length})
+            </Button>
+          </div>
+
+          <Card className="bg-slate-900/50 border-slate-800 backdrop-blur-sm flex-1 flex flex-col min-h-0">
+            {showSosPanel ? (
+              <>
+                <CardHeader className="flex-shrink-0">
+                  <CardTitle className="text-white flex items-center gap-2">
+                    <AlertTriangle className="w-5 h-5 text-red-500" />
+                    SOS Alerts
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="flex-1 overflow-y-auto min-h-0">
+                  {activeSosAlerts.length === 0 ? (
+                    <div className="text-center py-8">
+                      <AlertTriangle className="w-12 h-12 text-slate-600 mx-auto mb-2" />
+                      <p className="text-slate-500">No active SOS alerts</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {activeSosAlerts.map((alert: any) => (
+                        <div key={alert.id} className="p-4 bg-red-950/30 border border-red-900/50 rounded-lg">
+                          <div className="flex items-start justify-between mb-2">
+                            <div>
+                              <div className="font-semibold text-white">{alert.patrolName}</div>
+                              <div className="text-sm text-slate-400">{alert.campName}</div>
+                            </div>
+                            <Badge className="bg-red-600">
+                              {alert.status}
+                            </Badge>
+                          </div>
+                          <p className="text-sm text-red-400 mb-2">{alert.message}</p>
+                          <div className="text-xs text-slate-500 font-mono">
+                            {alert.latitude.toFixed(4)}, {alert.longitude.toFixed(4)}
+                          </div>
+                          <div className="flex gap-2 mt-3">
+                            <Button size="sm" variant="outline" className="flex-1 border-slate-700">
+                              <Navigation className="w-3 h-3 mr-1" />
+                              Route
+                            </Button>
+                            <Button size="sm" variant="outline" className="flex-1 border-slate-700">
+                              <Video className="w-3 h-3 mr-1" />
+                              Video
+                            </Button>
+                            <Button size="sm" variant="outline" className="flex-1 border-slate-700">
+                              <Phone className="w-3 h-3 mr-1" />
+                              Call
+                            </Button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </CardContent>
+              </>
+            ) : (
+              <>
+                <CardHeader className="flex-shrink-0">
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-white flex items-center gap-2">
+                      <Users className="w-5 h-5" />
+                      Patrols
+                    </CardTitle>
+                  </div>
+                  <div className="flex gap-2 mt-3">
+                    <select
+                      value={filterStatus}
+                      onChange={(e) => setFilterStatus(e.target.value)}
+                      className="bg-slate-800 border border-slate-700 rounded px-3 py-1 text-sm text-white"
+                    >
+                      <option value="all">All Status</option>
+                      <option value="patrolling">Patrolling</option>
+                      <option value="idle">Idle</option>
+                      <option value="sos">SOS</option>
+                      <option value="offline">Offline</option>
+                    </select>
+                    <Input
+                      placeholder="Search..."
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="bg-slate-800 border-slate-700 text-white text-sm h-8 w-32"
+                    />
+                  </div>
+                </CardHeader>
+                <CardContent className="flex-1 overflow-y-auto min-h-0">
+                  {filteredPatrols.length === 0 ? (
+                    <div className="text-center py-8">
+                      <Users className="w-12 h-12 text-slate-600 mx-auto mb-2" />
+                      <p className="text-slate-500">No patrols found</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {filteredPatrols.map((patrol: any) => (
+                        <div key={patrol.id} className="p-3 bg-slate-800/50 rounded-lg border border-slate-700">
+                          <div className="flex items-center justify-between mb-2">
+                            <div>
+                              <div className="font-semibold text-white">{patrol.name}</div>
+                              <div className="text-xs text-slate-400">{patrol.unit} • {patrol.camp}</div>
+                            </div>
+                            <Badge 
+                              className={
+                                patrol.status === 'patrolling' ? 'bg-emerald-600' :
+                                patrol.status === 'sos' ? 'bg-red-600' :
+                                patrol.status === 'offline' ? 'bg-slate-600' :
+                                'bg-blue-600'
+                              }
+                            >
+                              {patrol.status}
+                            </Badge>
+                          </div>
+                          <div className="flex items-center justify-between text-xs text-slate-500">
+                            <span>Strength: {patrol.strength}</span>
+                            {patrol.currentLatitude && (
+                              <span className="font-mono">
+                                {patrol.currentLatitude.toFixed(4)}, {patrol.currentLongitude.toFixed(4)}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </CardContent>
+              </>
+            )}
+          </Card>
+        </div>
+      </div>
+    </div>
+  );
+}
