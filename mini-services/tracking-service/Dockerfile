@@ -23,9 +23,9 @@ COPY tsconfig.json* ./
 # Expose the WebSocket port
 EXPOSE 3003
 
-# Health check (uses dynamic PORT with sane fallback)
+# Health check (uses Bun runtime + dynamic PORT with sane fallback)
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD sh -c 'node -e "const port=process.env.PORT||3003; require(\"http\").get(`http://127.0.0.1:${port}/health`, (r) => process.exit(r.statusCode===200?0:1)).on(\"error\", () => process.exit(1));"'
+  CMD bun -e "fetch('http://127.0.0.1:' + (process.env.PORT || '3003') + '/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
 # Start the WebSocket service
 CMD ["bun", "index.ts"]
