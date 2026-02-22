@@ -93,7 +93,7 @@ bun run db:seed
 
 ```
 NODE_ENV = production
-PORT = 3003
+# Do NOT set PORT on Railway; Railway injects this automatically
 ```
 
 4. Go to **"Networking"** tab
@@ -252,7 +252,25 @@ psql $DATABASE_URL -c "SELECT name, code FROM HQ;"
 2. In Vercel: Set `ALLOWED_ORIGINS` to your Vercel URL
 3. Redeploy both services
 
-### Fix 5: Deployment Timeout
+### Fix 5: Local `bun install` returns `403` (then `socket.io` is missing on start)
+
+**Problem:** `bun install` fails with `403`, and `bun run start` then fails with `Cannot find package 'socket.io'`.
+
+**Cause:** Network/proxy policy is blocking package tarball downloads from the default npm registry.
+
+**Solution:**
+1. Use your approved registry mirror in the same shell session:
+   ```bash
+   cd mini-services/tracking-service
+   NPM_CONFIG_REGISTRY=https://<your-approved-registry> bun install --no-frozen-lockfile
+   bun run start
+   ```
+2. Verify health locally:
+   ```bash
+   curl http://127.0.0.1:3003/health
+   ```
+
+### Fix 6: Deployment Timeout
 
 **Problem:** Build takes too long and times out
 
