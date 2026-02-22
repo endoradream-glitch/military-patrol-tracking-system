@@ -1,7 +1,25 @@
 import { createServer } from 'http';
-import { Server as SocketIOServer } from 'socket.io';
 
-const PORT = 3003;
+const DEFAULT_PORT = 3003;
+const parsedPort = Number.parseInt(process.env.PORT || '', 10);
+const PORT = Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535 ? parsedPort : DEFAULT_PORT;
+const HOST = process.env.HOST || '0.0.0.0';
+const DISPLAY_HOST = HOST === '0.0.0.0' ? 'localhost' : HOST;
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ?.split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+let SocketIOServer: any;
+try {
+  ({ Server: SocketIOServer } = await import('socket.io'));
+} catch (error) {
+  console.error('❌ Missing runtime dependency: socket.io');
+  console.error('   Install dependencies first: bun install --no-frozen-lockfile');
+  console.error('   If npm is blocked on your network, set NPM_CONFIG_REGISTRY to your approved mirror and retry.');
+  console.error('   Original error:', error instanceof Error ? error.message : String(error));
+  process.exit(1);
+}
 
 // In-memory storage for active connections
 const hqClients = new Set();
@@ -13,7 +31,7 @@ const httpServer = createServer();
 // Create Socket.IO server
 const io = new SocketIOServer(httpServer, {
   cors: {
-    origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
+    origin: allowedOrigins && allowedOrigins.length > 0 ? allowedOrigins : '*',
     methods: ['GET', 'POST'],
     credentials: true
   }
@@ -284,10 +302,11 @@ io.on('connection', (socket) => {
 });
 
 // Start server
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, HOST, () => {
   console.log(`✅ Tracking Service running on port ${PORT}`);
-  console.log(`   WebSocket endpoint: ws://localhost:${PORT}`);
-  console.log(`   Health check: http://localhost:${PORT}/health`);
+  console.log(`   Host binding: ${HOST}`);
+  console.log(`   WebSocket endpoint: ws://${DISPLAY_HOST}:${PORT}`);
+  console.log(`   Health check: http://${DISPLAY_HOST}:${PORT}/health`);
 });
 
 // Health check endpoint
@@ -304,7 +323,11 @@ httpServer.on('request', (req, res) => {
         patrols: patrolClients.size
       }
     }));
+    return;
   }
+
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Not found' }));
 });
 
 // Handle graceful shutdown
