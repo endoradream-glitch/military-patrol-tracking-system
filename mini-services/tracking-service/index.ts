@@ -1,7 +1,7 @@
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 
-const PORT = 3003;
+const PORT = Number(process.env.PORT) || 3003;
 
 // In-memory storage for active connections
 const hqClients = new Set();
@@ -286,8 +286,8 @@ io.on('connection', (socket) => {
 // Start server
 httpServer.listen(PORT, () => {
   console.log(`✅ Tracking Service running on port ${PORT}`);
-  console.log(`   WebSocket endpoint: ws://localhost:${PORT}`);
-  console.log(`   Health check: http://localhost:${PORT}/health`);
+  console.log(`   WebSocket endpoint: ws://0.0.0.0:${PORT}`);
+  console.log(`   Health check: http://0.0.0.0:${PORT}/health`);
 });
 
 // Health check endpoint
