@@ -81,7 +81,8 @@ bun run db:seed
 1. **Go to railway.app** dashboard
 2. Click **"New Project"** → **"Deploy from GitHub repo"**
 3. Select your `military-patrol-tracking-system` repository
-4. **IMPORTANT:** Set **Root Directory** to: `mini-services/tracking-service`
+4. **Preferred:** Set **Root Directory** to: `mini-services/tracking-service`
+   - If your Railway flow does not support nested roots, deploy from repo root using the root `Dockerfile` + `railway.json` added in this repo.
 5. Click **"Deploy Now"**
 6. Wait for deployment to complete (green checkmark)
 
